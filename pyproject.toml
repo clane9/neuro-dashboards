@@ -1,0 +1,39 @@
+[tool.poetry]
+name = "neuro-dashboards"
+version = "0.1.0"
+description = ""
+authors = ["Connor Lane <connor.lane858@gmail.com>"]
+readme = "README.md"
+packages = [{include = "timeseries_viewer"}]
+
+[tool.poetry.dependencies]
+python = ">=3.8,<3.12"
+numpy = "^1.24.2"
+scipy = "^1.10.1"
+matplotlib = "^3.7.0"
+nilearn = "^0.10.0"
+nibabel = "^5.0.1"
+holoviews = "^1.15.4"
+hvplot = "^0.8.2"
+panel = "^0.14.3"
+jupyter = "^1.0.0"
+ipython = "^8.10.0"
+jupyterlab = "^3.6.1"
+pandas = "^1.5.3"
+pre-commit = "^3.0.4"
+
+[tool.isort]
+profile = "black"
+
+[tool.pytest.ini_options]
+log_cli = true
+log_cli_level = "DEBUG"
+
+[tool.mypy]
+no_strict_optional = true
+ignore_missing_imports = true
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
