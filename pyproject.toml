@@ -21,6 +21,9 @@ ipython = "^8.10.0"
 jupyterlab = "^3.6.1"
 pandas = "^1.5.3"
 pre-commit = "^3.0.4"
+pycortex = "^1.2.6"
+shapely = "^2.0.1"
+pytest = "^7.2.1"
 
 [tool.isort]
 profile = "black"

@@ -2,17 +2,23 @@
 A pyviz panel/holoviews app for visualizing fMRI timeseries.
 """
 
+import logging
 from argparse import ArgumentParser
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Union
+from typing import List, Union
 
 import holoviews as hv
 import numpy as np
 import panel as pn
 from bokeh.models import HoverTool
 from matplotlib.colors import LinearSegmentedColormap
+from sklearn.decomposition import PCA
 
+from neuro_dashboards.utils.parcellations import Parcellation, get_schaefer
+
+logging.basicConfig(level=logging.INFO)
 hv.extension("bokeh")
 pn.extension(sizing_mode="stretch_width")
 
@@ -20,20 +26,44 @@ HEIGHT = 300
 CMAP = LinearSegmentedColormap.from_list(
     "conmat", ["blue", "cyan", "white", "yellow", "red"]
 )
+AVAILABLE_PARCS = [f"schaefer{parcels}" for parcels in range(100, 1100, 100)]
+CACHE = {}
 
 
-def main(args):
+@dataclass
+class Args:
+    parc: str
+    port: int
+    paths: List[str]
+
+
+def get_parser() -> ArgumentParser:
+    parser = ArgumentParser("timeseries_viewer")
+    parser.add_argument(
+        "--parc",
+        type=str,
+        default=None,
+        choices=AVAILABLE_PARCS,
+        help="Name of parcellation",
+    )
+    parser.add_argument("--port", type=int, default=8310, help="App port")
+    parser.add_argument("paths", nargs="+", help="Timeseries path(s)")
+    return parser
+
+
+def main(args: Args):
+    if args.parc is not None:
+        CACHE["parc"] = get_parcellation(args.parc)
     timeseries = get_timeseries(args.paths[0])
 
     path_select = pn.widgets.Select(
         name="TS path", value=args.paths[0], options=args.paths
     )
-
     frame_slider = pn.widgets.IntSlider(
         name="Time",
         value=0,
         start=0,
-        end=timeseries.shape[1],
+        end=(timeseries.shape[1] - 1),
     )
     width_slider = pn.widgets.IntSlider(
         name="Width",
@@ -42,49 +72,82 @@ def main(args):
         step=2,
         end=timeseries.shape[1],
     )
+    backward = pn.widgets.Button(name="\u25c0", width=50)
+    forward = pn.widgets.Button(name="\u25b6", width=50)
     ranges_input = pn.widgets.TextInput(
         name="Timeseries ranges", placeholder="0,1,3-5", value="0"
     )
 
+    grad_options = {"PC1": 1, "PC2": 2, "PC3": 3, "None": -1}
+    grad_select = pn.widgets.Select(name="Gradient", value=1, options=grad_options)
+
     def update_end(path: str):
         timeseries = get_timeseries(path)
-        frame_slider.end = timeseries.shape[1]
+        frame_slider.end = timeseries.shape[1] - 1
         width_slider.end = timeseries.shape[1]
 
     pn.bind(update_end, path=path_select)
 
-    carpet = pn.depends(path=path_select)(plot_carpet)
+    def shift_back(event):
+        step = max(width_slider.value // 3, 1)
+        frame = max(frame_slider.start, frame_slider.value - step)
+        frame_slider.value = frame
 
+    def shift_forward(event):
+        step = max(width_slider.value // 3, 1)
+        frame = min(frame_slider.end, frame_slider.value + step)
+        frame_slider.value = frame
+
+    backward.on_click(shift_back)
+    forward.on_click(shift_forward)
+
+    carpet = pn.depends(path=path_select)(plot_carpet)
     conmat = pn.depends(path=path_select, frame=frame_slider, width=width_slider)(
         plot_conmat
     )
-
     window = pn.depends(path=path_select, frame=frame_slider, width=width_slider)(
         plot_window
     )
-
     lines = pn.depends(path=path_select, ranges=ranges_input)(plot_lines)
     rms = pn.depends(path=path_select)(plot_rms)
+    gradients = pn.depends(
+        path=path_select,
+        frame=frame_slider,
+        width=width_slider,
+        selected_comp=grad_select,
+    )(plot_gradients)
 
     carpet_dmap = hv.DynamicMap(carpet)
     conmat_dmap = hv.DynamicMap(conmat)
     window_dmap = hv.DynamicMap(window)
     lines_dmap = hv.DynamicMap(lines)
     rms_dmap = hv.DynamicMap(rms)
+    gradients_dmap = hv.DynamicMap(gradients)
 
     app = pn.template.BootstrapTemplate(title="Timeseries viewer")
-    app.sidebar.extend([path_select, frame_slider, width_slider, ranges_input])
-    app.main.append(
-        pn.Column(
-            ((carpet_dmap * window_dmap) + conmat_dmap).opts(shared_axes=False),
-            ((lines_dmap * window_dmap) + (rms_dmap * window_dmap)).cols(1),
-        )
+    app.sidebar.extend(
+        [
+            path_select,
+            grad_select,
+            ranges_input,
+            frame_slider,
+            width_slider,
+            pn.Row(backward, forward),
+        ]
     )
+
+    ts_view = pn.Column(
+        ((carpet_dmap * window_dmap) + conmat_dmap).opts(shared_axes=False),
+        ((lines_dmap * window_dmap) + (rms_dmap * window_dmap)).cols(1),
+    )
+    grad_view = pn.Column(gradients_dmap, (rms_dmap * window_dmap))
+    app.main.append(pn.Tabs(("Timeseries", ts_view), ("Gradients", grad_view)))
     pn.serve(app, port=args.port)
 
 
 @lru_cache(maxsize=2)
 def get_timeseries(path: Union[str, Path], scale: bool = False):
+    logging.info(f"Loading timeseries {path}")
     path = Path(path)
 
     timeseries: np.ndarray
@@ -127,6 +190,12 @@ def plot_conmat(path: str, frame: int, width: int):
     ]
     hover = HoverTool(tooltips=tooltips)
 
+    # restricting zoom out
+    # https://github.com/holoviz/holoviews/issues/1019
+    def set_bounds(fig, _):
+        fig.state.x_range.bounds = (0, mat.shape[1])
+        fig.state.y_range.bounds = (0, mat.shape[0])
+
     # NOTE: Raster uses expected origin and axis limits; Image doesn't
     img = (
         hv.Raster(mat)
@@ -139,6 +208,7 @@ def plot_conmat(path: str, frame: int, width: int):
             frame_height=HEIGHT,
             data_aspect=1.0,
             tools=[hover],
+            hooks=[set_bounds],
         )
         .redim(z={"range": (-vmax, vmax)})
     )
@@ -154,6 +224,12 @@ def plot_carpet(path: str):
     ]
     hover = HoverTool(tooltips=tooltips)
 
+    # restricting zoom out
+    # https://github.com/holoviz/holoviews/issues/1019
+    def set_bounds(fig, _):
+        fig.state.x_range.bounds = (0, timeseries.shape[1])
+        fig.state.y_range.bounds = (0, timeseries.shape[0])
+
     img = (
         hv.Image(
             np.flipud(timeseries),
@@ -167,6 +243,7 @@ def plot_carpet(path: str):
             frame_height=HEIGHT,
             responsive=True,
             tools=[hover],
+            hooks=[set_bounds],
         )
         .redim(z={"range": (-3, 3)})
     )
@@ -237,9 +314,95 @@ def plot_rms(path: str):
     return rms
 
 
+def plot_gradients(
+    path: str,
+    frame: int,
+    width: int,
+    selected_comp: int,
+):
+    parc: Parcellation = CACHE.get("parc")
+
+    if parc is None or selected_comp < 0:
+        # Dummy plot, much faster to render.
+        # NOTE: you can't plot this first.
+        # NOTE: struggled to make these plots responsive.
+        img = hv.Polygons([], vdims=["value", "name", "index"]).opts(
+            title="None",
+            cmap=CMAP,
+            colorbar=True,
+            xaxis=None,
+            yaxis=None,
+            tools=["hover"],
+            toolbar="above",
+        )
+        return img
+
+    gradients = get_principal_gradients(path, frame, width, selected_comp)
+    gradient = gradients[-1]
+    vmax = np.quantile(np.abs(gradient), 0.95)
+
+    poly_list = parc.poly_list(values=gradient)
+    img = (
+        hv.Polygons(poly_list, vdims=["value", "name", "index"])
+        .opts(
+            title="Mean" if selected_comp == 0 else f"PC{selected_comp}",
+            cmap=CMAP,
+            colorbar=True,
+            xaxis=None,
+            yaxis=None,
+            data_aspect=1.0,
+            tools=["hover"],
+            toolbar="above",
+        )
+        .redim(value={"range": (-vmax, vmax)})
+    )
+    return img
+
+
+@lru_cache(maxsize=128)
+def get_principal_gradients(
+    path: str,
+    frame: int,
+    width: int,
+    n_components: int,
+) -> np.ndarray:
+
+    timeseries = get_timeseries(path)
+    start, stop = get_window(frame, width, timeseries.shape[1])
+    window = np.ascontiguousarray(timeseries[:, start:stop].T)
+
+    gradients = np.full((n_components + 1, window.shape[1]), np.nan)
+    valid_nc = min(len(window) - 1, n_components)
+    if valid_nc == 0:
+        gradients[0] = window.mean(axis=0)
+    else:
+        embed = PCA(n_components=valid_nc, svd_solver="randomized", random_state=42)
+        embed.fit(window)
+        gradients[0] = embed.mean_
+        gradients[1:] = embed.singular_values_[:, None] * embed.components_
+
+        # deal with sign flips; hack
+        gradients[1:] *= np.sign(np.sum(gradients[1:], axis=1, keepdims=True))
+    return gradients
+
+
+def get_parcellation(name: str) -> Parcellation:
+    logging.info(f"Loading parcellation {name}")
+    name = name.lower()
+
+    # schaefer200
+    if name.startswith("schaefer"):
+        parcels = int(name[len("schaefer") :])
+        parc = get_schaefer(parces=parcels)
+    else:
+        raise NotImplementedError(f"Parcellation {name} not supported")
+
+    # pre-compute ROI polys
+    parc.poly_list()
+    return parc
+
+
 if __name__ == "__main__":
-    parser = ArgumentParser("timeseries_viewer")
-    parser.add_argument("--port", "-p", type=int, default=8310, help="App port")
-    parser.add_argument("paths", nargs="+", help="Timeseries path(s)")
+    parser = get_parser()
     args = parser.parse_args()
     main(args)
