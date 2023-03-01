@@ -7,7 +7,7 @@ from argparse import ArgumentParser
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Union
+from typing import List, Tuple, Union
 
 import holoviews as hv
 import numpy as np
@@ -20,7 +20,14 @@ from neuro_dashboards.utils.parcellations import Parcellation, get_schaefer
 
 logging.basicConfig(level=logging.INFO)
 hv.extension("bokeh")
-pn.extension(sizing_mode="stretch_width")
+
+# Needed to get long filenames to scroll in multiselect
+css = """
+.bk.panel-multiselect * {
+    overflow-x: scroll;
+}
+"""
+pn.extension(sizing_mode="stretch_width", raw_css=[css])
 
 HEIGHT = 300
 CMAP = LinearSegmentedColormap.from_list(
@@ -54,10 +61,13 @@ def get_parser() -> ArgumentParser:
 def main(args: Args):
     if args.parc is not None:
         CACHE["parc"] = get_parcellation(args.parc)
-    timeseries = get_timeseries(args.paths[0])
+    timeseries, _ = get_timeseries(args.paths[:1])
 
-    path_select = pn.widgets.Select(
-        name="TS path", value=args.paths[0], options=args.paths
+    path_select = pn.widgets.MultiSelect(
+        name="TS path(s)",
+        value=args.paths[:1],
+        options={Path(p).name: p for p in args.paths},
+        css_classes=["panel-multiselect"],
     )
     frame_slider = pn.widgets.IntSlider(
         name="Time",
@@ -67,7 +77,7 @@ def main(args: Args):
     )
     width_slider = pn.widgets.IntSlider(
         name="Width",
-        value=1,
+        value=16,
         start=1,
         step=2,
         end=timeseries.shape[1],
@@ -81,12 +91,14 @@ def main(args: Args):
     grad_options = {"PC1": 1, "PC2": 2, "PC3": 3, "None": -1}
     grad_select = pn.widgets.Select(name="Gradient", value=1, options=grad_options)
 
-    def update_end(path: str):
-        timeseries = get_timeseries(path)
+    def reset_selection(event):
+        timeseries, _ = get_timeseries(event.new)
         frame_slider.end = timeseries.shape[1] - 1
         width_slider.end = timeseries.shape[1]
+        frame_slider.value = 0
+        width_slider.value = 16
 
-    pn.bind(update_end, path=path_select)
+    path_select.param.watch(reset_selection, ["value"])
 
     def shift_back(event):
         step = max(width_slider.value // 3, 1)
@@ -101,27 +113,30 @@ def main(args: Args):
     backward.on_click(shift_back)
     forward.on_click(shift_forward)
 
-    carpet = pn.depends(path=path_select)(plot_carpet)
-    conmat = pn.depends(path=path_select, frame=frame_slider, width=width_slider)(
+    carpet = pn.depends(paths=path_select)(plot_carpet)
+    conmat = pn.depends(paths=path_select, frame=frame_slider, width=width_slider)(
         plot_conmat
     )
-    window = pn.depends(path=path_select, frame=frame_slider, width=width_slider)(
+    window = pn.depends(paths=path_select, frame=frame_slider, width=width_slider)(
         plot_window
     )
-    lines = pn.depends(path=path_select, ranges=ranges_input)(plot_lines)
-    rms = pn.depends(path=path_select)(plot_rms)
+    breaks = pn.depends(paths=path_select)(plot_breaks)
+    lines = pn.depends(paths=path_select, ranges=ranges_input)(plot_lines)
+    rms = pn.depends(paths=path_select)(plot_rms)
     gradients = pn.depends(
-        path=path_select,
+        paths=path_select,
         frame=frame_slider,
         width=width_slider,
         selected_comp=grad_select,
     )(plot_gradients)
 
-    carpet_dmap = hv.DynamicMap(carpet)
+    # NOTE: framewise=True needed to get the axis ranges to update
+    carpet_dmap = hv.DynamicMap(carpet).opts(framewise=True)
     conmat_dmap = hv.DynamicMap(conmat)
     window_dmap = hv.DynamicMap(window)
-    lines_dmap = hv.DynamicMap(lines)
-    rms_dmap = hv.DynamicMap(rms)
+    breaks_dmap = hv.DynamicMap(breaks)
+    lines_dmap = hv.DynamicMap(lines).opts(framewise=True)
+    rms_dmap = hv.DynamicMap(rms).opts(framewise=True)
     gradients_dmap = hv.DynamicMap(gradients)
 
     app = pn.template.BootstrapTemplate(title="Timeseries viewer")
@@ -137,19 +152,35 @@ def main(args: Args):
     )
 
     ts_view = pn.Column(
-        ((carpet_dmap * window_dmap) + conmat_dmap).opts(shared_axes=False),
-        ((lines_dmap * window_dmap) + (rms_dmap * window_dmap)).cols(1),
+        ((carpet_dmap * window_dmap * breaks_dmap) + conmat_dmap).opts(
+            shared_axes=False
+        ),
+        (
+            (lines_dmap * window_dmap * breaks_dmap)
+            + (rms_dmap * window_dmap * breaks_dmap)
+        ).cols(1),
     )
-    grad_view = pn.Column(gradients_dmap, (rms_dmap * window_dmap))
+    grad_view = pn.Column(gradients_dmap, (rms_dmap * window_dmap * breaks_dmap))
     app.main.append(pn.Tabs(("Timeseries", ts_view), ("Gradients", grad_view)))
     pn.serve(app, port=args.port)
 
 
-@lru_cache(maxsize=2)
-def get_timeseries(path: Union[str, Path], scale: bool = False):
-    logging.info(f"Loading timeseries {path}")
-    path = Path(path)
+def get_timeseries(paths: List[str]):
+    return _get_timeseries(tuple(paths))
 
+
+@lru_cache(maxsize=1)
+def _get_timeseries(paths: Tuple[str, ...]):
+    logging.info(f"Loading timeseries\n\t{paths}")
+    timeseries = [get_single_timeseries(p) for p in paths]
+    breaks = np.cumsum(np.array([0] + [len(ts) for ts in timeseries]))
+    timeseries = np.concatenate(timeseries)
+    timeseries = np.ascontiguousarray(timeseries.T)
+    return timeseries, breaks
+
+
+def get_single_timeseries(path: Union[str, Path]):
+    path = Path(path)
     timeseries: np.ndarray
     if path.suffix == ".tsv":
         # TODO: what is the shape of these files?
@@ -158,13 +189,8 @@ def get_timeseries(path: Union[str, Path], scale: bool = False):
         timeseries = np.load(path)
     else:
         raise ValueError(f"Invalid path {path}; expected .tsv or .npy")
-
-    timeseries = np.ascontiguousarray(timeseries.T)
-    timeseries -= timeseries.mean(axis=1, keepdims=True)
-    timeseries /= timeseries.std(axis=1, keepdims=True) + 1e-8
-
-    if scale:
-        timeseries /= np.sqrt(np.mean(timeseries**2, axis=0))
+    timeseries -= timeseries.mean(axis=0)
+    timeseries /= timeseries.std(axis=0) + 1e-8
     return timeseries
 
 
@@ -174,8 +200,8 @@ def get_window(frame: int, width: int, length: int):
     return start, stop
 
 
-def plot_conmat(path: str, frame: int, width: int):
-    timeseries = get_timeseries(path)
+def plot_conmat(paths: List[str], frame: int, width: int):
+    timeseries, _ = get_timeseries(paths)
 
     start, stop = get_window(frame, width, timeseries.shape[1])
     window = timeseries[:, start:stop]
@@ -215,8 +241,8 @@ def plot_conmat(path: str, frame: int, width: int):
     return img
 
 
-def plot_carpet(path: str):
-    timeseries = get_timeseries(path)
+def plot_carpet(paths: List[str]):
+    timeseries, _ = get_timeseries(paths)
 
     tooltips = [
         ("(i, t)", "($y{0}, $x{0})"),
@@ -244,14 +270,15 @@ def plot_carpet(path: str):
             responsive=True,
             tools=[hover],
             hooks=[set_bounds],
+            xlim=(0, timeseries.shape[1]),
         )
         .redim(z={"range": (-3, 3)})
     )
     return img
 
 
-def plot_window(path: str, frame: int, width: int):
-    timeseries = get_timeseries(path)
+def plot_window(paths: List[str], frame: int, width: int):
+    timeseries, _ = get_timeseries(paths)
     start, stop = get_window(frame, width, timeseries.shape[1])
 
     # NOTE: also tried Box and Rectangles. Box didn't allow filled color.
@@ -261,8 +288,15 @@ def plot_window(path: str, frame: int, width: int):
     return span
 
 
-def plot_lines(path: str, ranges: str):
-    timeseries = get_timeseries(path)
+def plot_breaks(paths: List[str]):
+    _, breaks = get_timeseries(paths)
+    lines = {brk: hv.VLine(brk).opts(color="black", alpha=0.5) for brk in breaks}
+    overlay = hv.NdOverlay(lines)
+    return overlay
+
+
+def plot_lines(paths: List[str], ranges: str):
+    timeseries, _ = get_timeseries(paths)
     indices = parse_ranges(ranges)
     curve_dict = {idx: plot_line(timeseries, idx) for idx in indices}
     overlay = hv.NdOverlay(curve_dict, kdims=["ROI"])
@@ -296,12 +330,13 @@ def plot_line(timeseries: np.ndarray, index: int):
         responsive=True,
         alpha=0.7,
         tools=["hover"],
+        xlim=(0, timeseries.shape[1]),
     )
     return line
 
 
-def plot_rms(path: str):
-    timeseries = get_timeseries(path)
+def plot_rms(paths: List[str]):
+    timeseries, _ = get_timeseries(paths)
     x = np.arange(timeseries.shape[1])
     y = np.sqrt(np.mean(timeseries**2, axis=0))
     rms = hv.Curve((x, y), kdims=["TR"], vdims=["RMS"]).opts(
@@ -310,12 +345,13 @@ def plot_rms(path: str):
         color="black",
         alpha=0.7,
         tools=["hover"],
+        xlim=(0, timeseries.shape[1]),
     )
     return rms
 
 
 def plot_gradients(
-    path: str,
+    paths: List[str],
     frame: int,
     width: int,
     selected_comp: int,
@@ -326,6 +362,7 @@ def plot_gradients(
         # Dummy plot, much faster to render.
         # NOTE: you can't plot this first.
         # NOTE: struggled to make these plots responsive.
+        # TODO: what if you reload the page?
         img = hv.Polygons([], vdims=["value", "name", "index"]).opts(
             title="None",
             cmap=CMAP,
@@ -337,7 +374,7 @@ def plot_gradients(
         )
         return img
 
-    gradients = get_principal_gradients(path, frame, width, selected_comp)
+    gradients = get_principal_gradients(tuple(paths), frame, width, selected_comp)
     gradient = gradients[-1]
     vmax = np.quantile(np.abs(gradient), 0.95)
 
@@ -361,13 +398,13 @@ def plot_gradients(
 
 @lru_cache(maxsize=128)
 def get_principal_gradients(
-    path: str,
+    paths: Tuple[str, ...],
     frame: int,
     width: int,
     n_components: int,
 ) -> np.ndarray:
 
-    timeseries = get_timeseries(path)
+    timeseries, _ = get_timeseries(paths)
     start, stop = get_window(frame, width, timeseries.shape[1])
     window = np.ascontiguousarray(timeseries[:, start:stop].T)
 

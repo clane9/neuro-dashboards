@@ -4,11 +4,11 @@ version = "0.1.0"
 description = ""
 authors = ["Connor Lane <connor.lane858@gmail.com>"]
 readme = "README.md"
-packages = [{include = "timeseries_viewer"}]
+packages = [{include = "neuro_dashboards"}]
 
 [tool.poetry.dependencies]
-python = ">=3.8,<3.12"
-numpy = "^1.24.2"
+python = ">=3.9,<3.12"
+numpy = "~1.23"
 scipy = "^1.10.1"
 matplotlib = "^3.7.0"
 nilearn = "^0.10.0"
