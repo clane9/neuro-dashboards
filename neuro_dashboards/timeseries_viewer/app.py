@@ -67,6 +67,7 @@ def main(args: Args):
         name="TS path(s)",
         value=args.paths[:1],
         options={Path(p).name: p for p in args.paths},
+        size=16,
         css_classes=["panel-multiselect"],
     )
     frame_slider = pn.widgets.IntSlider(
